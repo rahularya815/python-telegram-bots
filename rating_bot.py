@@ -9,7 +9,6 @@ from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, Callb
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 
 # --- WEB SERVER (KEEP-ALIVE) ---
-# This mimics a website so Render allows the deploy
 app = Flask(__name__)
 
 @app.route('/')
@@ -17,11 +16,11 @@ def home():
     return "Bot is running!"
 
 def run_web_server():
-    # Render assigns a port automatically in the environment variable 'PORT'
     port = int(os.environ.get('PORT', 8080))
     app.run(host='0.0.0.0', port=port)
 
 # --- BOT CODE ---
+# New Structure: { message_id: { user_id: { 'score': 5, 'name': 'John' } } }
 post_votes = {}
 
 logging.basicConfig(
@@ -30,15 +29,23 @@ logging.basicConfig(
 )
 
 def get_keyboard():
+    # Row 1: 1-5
     row1 = [InlineKeyboardButton(str(i), callback_data=str(i)) for i in range(1, 6)]
+    # Row 2: 6-10
     row2 = [InlineKeyboardButton(str(i), callback_data=str(i)) for i in range(6, 11)]
-    return InlineKeyboardMarkup([row1, row2])
+    # Row 3: The "Who Voted?" button (Admin tool)
+    row3 = [InlineKeyboardButton("👁️ See Who Voted", callback_data="check_voters")]
+    
+    return InlineKeyboardMarkup([row1, row2, row3])
 
 async def add_rating_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.channel_post:
         return
     message = update.channel_post
     try:
+        # Initialize storage for this message
+        post_votes[message.message_id] = {}
+        
         await context.bot.send_message(
             chat_id=message.chat_id,
             text="📊 **Rate this post:**\nNo ratings yet.",
@@ -51,17 +58,50 @@ async def add_rating_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def handle_vote(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    user_id = query.from_user.id
-    new_score = int(query.data)
+    user = query.from_user
     message_id = query.message.message_id
     
-    await query.answer(f"You rated this {new_score}/10")
+    # --- HANDLE "CHECK VOTERS" BUTTON ---
+    if query.data == "check_voters":
+        if message_id not in post_votes or not post_votes[message_id]:
+            await query.answer("No one has voted yet!", show_alert=True)
+            return
 
+        # Create a list of names and scores
+        # Format: "John: 5"
+        voter_list = []
+        for uid, data in post_votes[message_id].items():
+            name = data['name']
+            score = data['score']
+            voter_list.append(f"{name}: {score}")
+        
+        # Join them with newlines
+        result_text = "Users who clicked:\n" + "\n".join(voter_list)
+        
+        # Show as a popup alert (only the clicker sees this)
+        await query.answer(result_text, show_alert=True)
+        return
+
+    # --- HANDLE RATING BUTTONS ---
+    new_score = int(query.data)
+    
+    # Initialize if missing
     if message_id not in post_votes:
         post_votes[message_id] = {}
-    post_votes[message_id][user_id] = new_score
 
-    scores = list(post_votes[message_id].values())
+    # Store Score AND Name
+    # We use user.first_name, but you could use user.username or user.full_name
+    user_name = user.username if user.username else user.first_name
+    post_votes[message_id][user.id] = {
+        'score': new_score,
+        'name': user_name
+    }
+
+    await query.answer(f"You rated this {new_score}/10")
+
+    # Calculate Average
+    # Extract just the scores from the dictionary
+    scores = [v['score'] for v in post_votes[message_id].values()]
     total_votes = len(scores)
     average_score = sum(scores) / total_votes
     filled_blocks = int(round(average_score))
@@ -73,6 +113,7 @@ async def handle_vote(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"({total_votes} votes)"
     )
 
+    # Only edit if text changed (prevents Telegram API errors)
     if new_text != query.message.text:
         await query.edit_message_text(
             text=new_text,
@@ -85,16 +126,12 @@ if __name__ == '__main__':
         print("Error: BOT_TOKEN is missing.")
         exit(1)
 
-    # 1. Start the dummy web server in a separate thread
-    # This satisfies Render's requirement to bind to a port
     server_thread = threading.Thread(target=run_web_server)
     server_thread.daemon = True
     server_thread.start()
 
-    # 2. Start the Bot
     application = ApplicationBuilder().token(BOT_TOKEN).build()
     
-    # Updated Filters for v20+
     channel_post_filter = filters.ChatType.CHANNEL & (
         filters.TEXT | 
         filters.PHOTO | 
