@@ -6,10 +6,30 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CallbackQueryHandler, CommandHandler, filters
 from telegram.error import BadRequest
 from pymongo import MongoClient
-
+import certifi 
 # --- CONFIGURATION ---
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 MONGO_URI = os.getenv('MONGO_URI')
+
+ # <--- Add this import at the top
+
+# ... (keep existing imports)
+
+# --- DATABASE SETUP ---
+if not MONGO_URI:
+    print("Error: MONGO_URI is missing.")
+
+try:
+    # We add tlsCAFile=certifi.where() to fix the SSL Handshake error
+    mongo_client = MongoClient(MONGO_URI, tlsCAFile=certifi.where())
+    db = mongo_client['telegram_bot_db']
+    votes_collection = db['post_votes']
+    
+    # Quick test to force a connection immediately
+    mongo_client.admin.command('ping')
+    print("✅ Connected to MongoDB successfully!")
+except Exception as e:
+    print(f"❌ Failed to connect to MongoDB: {e}")
 
 # --- DATABASE SETUP ---
 if not MONGO_URI:
@@ -263,3 +283,4 @@ if __name__ == '__main__':
 
     print("Bot is running...")
     application.run_polling()
+
