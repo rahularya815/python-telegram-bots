@@ -1,64 +1,60 @@
 import logging
 import os
 import threading
+import certifi  # <--- NEW: Fixes SSL Handshake errors
 from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CallbackQueryHandler, CommandHandler, filters
 from telegram.error import BadRequest
 from pymongo import MongoClient
-import certifi 
+from pymongo.errors import ServerSelectionTimeoutError
+
 # --- CONFIGURATION ---
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 MONGO_URI = os.getenv('MONGO_URI')
-
- # <--- Add this import at the top
-
-# ... (keep existing imports)
-
-# --- DATABASE SETUP ---
-if not MONGO_URI:
-    print("Error: MONGO_URI is missing.")
-
-try:
-    # We add tlsCAFile=certifi.where() to fix the SSL Handshake error
-    mongo_client = MongoClient(MONGO_URI, tlsCAFile=certifi.where())
-    db = mongo_client['telegram_bot_db']
-    votes_collection = db['post_votes']
-    
-    # Quick test to force a connection immediately
-    mongo_client.admin.command('ping')
-    print("✅ Connected to MongoDB successfully!")
-except Exception as e:
-    print(f"❌ Failed to connect to MongoDB: {e}")
-
-# --- DATABASE SETUP ---
-if not MONGO_URI:
-    print("Error: MONGO_URI is missing.")
-
-try:
-    mongo_client = MongoClient(MONGO_URI)
-    db = mongo_client['telegram_bot_db']
-    votes_collection = db['post_votes']
-    print("✅ Connected to MongoDB successfully!")
-except Exception as e:
-    print(f"❌ Failed to connect to MongoDB: {e}")
-
-# --- WEB SERVER ---
-app = Flask(__name__)
-
-@app.route('/')
-def home():
-    return "Bot is running with Leaderboard!"
-
-def run_web_server():
-    port = int(os.environ.get('PORT', 8080))
-    app.run(host='0.0.0.0', port=port)
 
 # --- LOGGING ---
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
+
+# --- DATABASE SETUP ---
+# We use a global variable for the collection
+votes_collection = None
+
+if not MONGO_URI:
+    logging.error("Error: MONGO_URI is missing. Set it in your environment variables.")
+else:
+    try:
+        # Create a new client and connect to the server
+        # tlsCAFile=certifi.where() is CRITICAL for Render to trust MongoDB's certificate
+        mongo_client = MongoClient(MONGO_URI, tlsCAFile=certifi.where())
+        
+        # Send a ping to confirm a successful connection
+        mongo_client.admin.command('ping')
+        
+        db = mongo_client['telegram_bot_db']
+        votes_collection = db['post_votes']
+        logging.info("✅ Connected to MongoDB successfully!")
+        
+    except ServerSelectionTimeoutError as e:
+        logging.error(f"❌ Failed to connect to MongoDB (Timeout): {e}")
+    except Exception as e:
+        logging.error(f"❌ Failed to connect to MongoDB (General Error): {e}")
+
+# --- WEB SERVER (KEEP-ALIVE) ---
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    if votes_collection is not None:
+        return "Bot is running and Connected to DB!"
+    return "Bot is running but Database connection FAILED."
+
+def run_web_server():
+    port = int(os.environ.get('PORT', 8080))
+    app.run(host='0.0.0.0', port=port)
 
 # --- HELPER FUNCTIONS ---
 
@@ -71,15 +67,16 @@ def get_keyboard():
 # --- BOT COMMANDS ---
 
 async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Shows the top 5 highest-rated posts.
-    Usage: /top
-    """
+    """Shows the top 5 highest-rated posts."""
+    if votes_collection is None:
+        await update.message.reply_text("❌ Database error: Cannot fetch top posts.")
+        return
+
     try:
-        # 1. Fetch all posts from MongoDB
+        # 1. Fetch all posts
         all_posts = list(votes_collection.find())
         
-        # 2. Calculate averages for each post
+        # 2. Calculate averages
         ranked_posts = []
         for post in all_posts:
             votes = post.get('votes', {})
@@ -90,20 +87,22 @@ async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not votes:
                 continue
 
-            # Calculate score
             scores = [v['score'] for v in votes.values()]
             avg_score = sum(scores) / len(scores)
             vote_count = len(scores)
 
-            # Store tuple: (Average Score, Vote Count, Title, Link Info)
+            # Construct a generic link to the post
+            # Note: This link format works for public channels. Private channels need a different format.
+            link = f"https://t.me/c/{str(chat_id)[4:]}/{message_id}"
+
             ranked_posts.append({
                 'avg': avg_score,
                 'count': vote_count,
                 'title': title,
-                'link': f"https://t.me/c/{str(chat_id)[4:]}/{message_id}" # Construct generic private link
+                'link': link
             })
 
-        # 3. Sort: Primary by Score (Desc), Secondary by Vote Count (Desc)
+        # 3. Sort by Score (Desc), then by Vote Count (Desc)
         ranked_posts.sort(key=lambda x: (x['avg'], x['count']), reverse=True)
 
         # 4. Take top 5
@@ -113,10 +112,9 @@ async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("No rated posts found yet!")
             return
 
-        # 5. Build the Message
+        # 5. Build Message
         msg_lines = ["🏆 **Top Rated Posts** 🏆\n"]
         for i, post in enumerate(top_5, 1):
-            # Format: 1. Python Tutorial - ⭐ 9.5 (20 votes)
             line = (
                 f"{i}. [{post['title']}]({post['link']})\n"
                 f"   ⭐ **{post['avg']:.1f}/10** ({post['count']} votes)"
@@ -137,24 +135,27 @@ async def add_rating_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     message = update.channel_post
     
+    if votes_collection is None:
+        logging.error("Cannot save post: Database not connected.")
+        return
+
     try:
-        # EXTRACT TITLE (Text or Caption)
-        # We grab the first 30 chars to use as the "Title" in the leaderboard
+        # Extract Title (First 30 chars)
         post_text = message.text or message.caption or "Media Post"
         short_title = post_text[:30] + "..." if len(post_text) > 30 else post_text
         
-        # SAVE TO DB
+        # Initial Data Structure
         initial_data = {
             '_id': message.message_id,
             'chat_id': message.chat_id,
-            'title': short_title,  # <--- NEW: Saving the title
+            'title': short_title,
             'votes': {}
         }
         
         try:
             votes_collection.insert_one(initial_data)
         except Exception:
-            pass 
+            pass # Document likely already exists
         
         await context.bot.send_message(
             chat_id=message.chat_id,
@@ -172,9 +173,14 @@ async def handle_vote(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message_id = query.message.message_id
     chat_id = query.message.chat_id
 
+    if votes_collection is None:
+        await query.answer("❌ Database Error. Try again later.", show_alert=True)
+        return
+
     # 1. FETCH DATA
     post_data = votes_collection.find_one({'_id': message_id})
     if not post_data:
+        # Create on the fly if missing
         post_data = {'_id': message_id, 'chat_id': chat_id, 'votes': {}}
         votes_collection.insert_one(post_data)
 
@@ -277,10 +283,7 @@ if __name__ == '__main__':
 
     application.add_handler(MessageHandler(channel_post_filter, add_rating_buttons))
     application.add_handler(CallbackQueryHandler(handle_vote))
-    
-    # NEW: Add the /top command handler
     application.add_handler(CommandHandler("top", cmd_top))
 
     print("Bot is running...")
     application.run_polling()
-
