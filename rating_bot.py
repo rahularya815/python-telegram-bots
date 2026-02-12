@@ -26,7 +26,7 @@ if not MONGO_URI:
     logging.error("❌ MONGO_URI is missing from environment variables.")
 else:
     try:
-        # tlsCAFile=certifi.where() solves the SSL handshake error on Render
+        # tlsCAFile=certifi.where() solves SSL handshake errors on Render
         mongo_client = MongoClient(MONGO_URI, tlsCAFile=certifi.where())
         mongo_client.admin.command('ping')
         db = mongo_client['telegram_bot_db']
@@ -40,7 +40,8 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bot is running!"
+    status = "Online" if votes_collection is not None else "DB Offline"
+    return f"Bot is running! DB Status: {status}"
 
 def run_web_server():
     port = int(os.environ.get('PORT', 8080))
@@ -49,6 +50,7 @@ def run_web_server():
 # --- HELPER FUNCTIONS ---
 
 def get_keyboard():
+    """Generates the 1-10 rating grid and the view button."""
     row1 = [InlineKeyboardButton(str(i), callback_data=str(i)) for i in range(1, 6)]
     row2 = [InlineKeyboardButton(str(i), callback_data=str(i)) for i in range(6, 11)]
     row3 = [InlineKeyboardButton("👁️ See Who Voted", callback_data="check_voters")]
@@ -57,6 +59,7 @@ def get_keyboard():
 # --- COMMAND HANDLERS ---
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Replies to /start in private or channel."""
     await update.effective_message.reply_text(
         "👋 Welcome! I am your Channel Rating Bot.\n"
         "I add rating buttons to your channel posts automatically.\n\n"
@@ -64,6 +67,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Replies to /help."""
     help_text = (
         "🤖 **Bot Help & Instructions**\n\n"
         "• **Rating:** I automatically add 1-10 buttons to new channel posts.\n"
@@ -76,6 +80,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(help_text, parse_mode='Markdown')
 
 async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Calculates and displays the leaderboard."""
     if votes_collection is None:
         await update.effective_message.reply_text("❌ Database not connected.")
         return
@@ -102,6 +107,7 @@ async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 'link': link
             })
 
+        # Sort by avg rating, then by vote count
         ranked_posts.sort(key=lambda x: (x['avg'], x['count']), reverse=True)
         top_5 = ranked_posts[:5]
 
@@ -120,21 +126,29 @@ async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- MESSAGE HANDLERS ---
 
 async def add_rating_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.channel_post or votes_collection is None:
+    """Automatically adds buttons to new channel content."""
+    if not update.channel_post:
         return
     
     msg = update.channel_post
-    text = msg.text or msg.caption or "Media Post"
-    title = text[:30] + "..." if len(text) > 30 else text
+    raw_text = msg.text or msg.caption or "Media Post"
+    title = (raw_text[:30] + "..") if len(raw_text) > 30 else raw_text
 
+    # 1. ATTEMPT DATABASE RECORD
+    if votes_collection is not None:
+        try:
+            votes_collection.insert_one({
+                '_id': msg.message_id,
+                'chat_id': msg.chat_id,
+                'title': title,
+                'votes': {}
+            })
+        except Exception as e:
+            logging.error(f"DB insert failed for {msg.message_id}: {e}")
+            # We continue anyway so buttons are sent regardless of DB status
+
+    # 2. ATTEMPT SENDING BUTTONS
     try:
-        votes_collection.insert_one({
-            '_id': msg.message_id,
-            'chat_id': msg.chat_id,
-            'title': title,
-            'votes': {}
-        })
-        
         await context.bot.send_message(
             chat_id=msg.chat_id,
             text="📊 **Rate this post:**",
@@ -143,21 +157,29 @@ async def add_rating_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE)
             parse_mode='Markdown'
         )
     except Exception as e:
-        logging.error(f"Button error: {e}")
+        logging.error(f"Failed to send rating buttons: {e}")
 
 async def handle_vote(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manages button clicks (votes and viewer list)."""
     query = update.callback_query
     user = query.from_user
     msg_id = query.message.message_id
     chat_id = query.message.chat_id
 
+    if votes_collection is None:
+        await query.answer("❌ Database connection error.", show_alert=True)
+        return
+
     post_data = votes_collection.find_one({'_id': msg_id})
-    if not post_data: return
+    if not post_data:
+        # Create record if missing (e.g., bot restarted or added after post)
+        post_data = {'_id': msg_id, 'chat_id': chat_id, 'votes': {}, 'title': 'Old Post'}
+        votes_collection.insert_one(post_data)
 
     votes = post_data.get('votes', {})
 
+    # PATH A: SEE WHO VOTED
     if query.data == "check_voters":
-        # Check admin status
         is_admin = False
         try:
             member = await context.bot.get_chat_member(chat_id, user.id)
@@ -165,7 +187,11 @@ async def handle_vote(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except: pass
 
         if not is_admin and str(user.id) not in votes:
-            await query.answer("🔒 Vote first to see the list!", show_alert=True)
+            await query.answer("🔒 Please vote first to see the list!", show_alert=True)
+            return
+
+        if not votes:
+            await query.answer("No votes yet!", show_alert=True)
             return
 
         lines = []
@@ -173,11 +199,11 @@ async def handle_vote(update: Update, context: ContextTypes.DEFAULT_TYPE):
             name = data.get('name', 'User')
             lines.append(f"• {name}" + (f": {data['score']}" if is_admin else ""))
         
-        res = ("👮 Admin View:\n" if is_admin else "👥 Voters:\n") + "\n".join(lines)
-        await query.answer(res[:195], show_alert=True)
+        res_header = "👮 Admin (Names + Scores):\n" if is_admin else "👥 Voters:\n"
+        await query.answer((res_header + "\n".join(lines))[:195], show_alert=True)
         return
 
-    # Process actual vote
+    # PATH B: VOTE BUTTON (1-10)
     score = int(query.data)
     user_name = f"{user.first_name} {user.last_name or ''}".strip()
     
@@ -186,9 +212,9 @@ async def handle_vote(update: Update, context: ContextTypes.DEFAULT_TYPE):
         {'$set': {f'votes.{user.id}': {'score': score, 'name': user_name}}}
     )
 
-    await query.answer(f"Rated {score}/10")
+    await query.answer(f"Success! You rated: {score}/10")
 
-    # Update UI
+    # Update the Progress Bar
     updated = votes_collection.find_one({'_id': msg_id})
     v_list = [v['score'] for v in updated['votes'].values()]
     avg = sum(v_list) / len(v_list)
@@ -200,24 +226,28 @@ async def handle_vote(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(new_text, reply_markup=get_keyboard(), parse_mode='Markdown')
         except: pass
 
+# --- MAIN LOOP ---
 if __name__ == '__main__':
-    server_thread = threading.Thread(target=run_web_server)
-    server_thread.daemon = True
-    server_thread.start()
+    # Start Keep-Alive Server
+    threading.Thread(target=run_web_server, daemon=True).start()
 
+    # Build Application
     app_bot = ApplicationBuilder().token(BOT_TOKEN).build()
     
-    # 1. Commands (Work everywhere)
+    # 1. COMMANDS (Registered FIRST for priority)
     app_bot.add_handler(CommandHandler("start", cmd_start))
     app_bot.add_handler(CommandHandler("help", cmd_help))
     app_bot.add_handler(CommandHandler("top", cmd_top))
 
-    # 2. Callbacks
+    # 2. BUTTON CLICKS
     app_bot.add_handler(CallbackQueryHandler(handle_vote))
 
-    # 3. Channel Posts (Ignore commands)
-    c_filter = filters.ChatType.CHANNEL & (filters.TEXT | filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.ANIMATION) & ~filters.COMMAND
+    # 3. CHANNEL POSTS
+    # We ignore commands ( ~filters.COMMAND ) so they don't get rated
+    c_filter = filters.ChatType.CHANNEL & (
+        filters.TEXT | filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.ANIMATION
+    ) & ~filters.COMMAND
     app_bot.add_handler(MessageHandler(c_filter, add_rating_buttons))
 
-    print("🤖 Bot is live...")
+    logging.info("🤖 Bot is active and ready.")
     app_bot.run_polling()
